@@ -32,3 +32,18 @@ build/
 
 # Tauri build artifacts
 src-tauri/target/
+
+# Local tools and visual-review output
+.cache/
+.env
+.env.*
+!.env.example
+artifacts/
+playwright-report/
+test-results/
+blob-report/
+.playwright-cli/
+.vscode/*
+!.vscode/extensions.json
+.DS_Store
+Thumbs.db

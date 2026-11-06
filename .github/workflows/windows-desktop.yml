@@ -1,0 +1,153 @@
+name: Windows Desktop CI
+
+on:
+  push:
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  CARGO_TERM_COLOR: always
+  CARGO_INCREMENTAL: "0"
+
+jobs:
+  windows-build:
+    name: Build Windows x64 installers
+    runs-on: windows-latest
+    timeout-minutes: 45
+    defaults:
+      run:
+        shell: pwsh
+    steps:
+      - name: Check out source
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      - name: Set up Node.js
+        uses: actions/setup-node@949feb2413d6458794dcd2491c4babbbce0c15c1 # v7.1.0
+        with:
+          node-version: "24"
+          cache: npm
+          cache-dependency-path: package-lock.json
+
+      - name: Set up Rust for Windows MSVC
+        uses: dtolnay/rust-toolchain@b725eda525362e7cf34af9a7243cac1e3f01a7ec # stable branch, 2026-11-06
+        with:
+          toolchain: stable
+          targets: x86_64-pc-windows-msvc
+          components: rustfmt, clippy
+
+      - name: Cache Cargo dependencies
+        uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2.9.3
+        with:
+          workspaces: src-tauri -> target
+          save-if: ${{ github.ref == 'refs/heads/main' }}
+
+      - name: Install locked frontend dependencies
+        run: npm ci
+
+      - name: Check Rust formatting
+        run: cargo fmt --manifest-path src-tauri/Cargo.toml --all -- --check
+
+      - name: Build and bundle Tauri for Windows
+        uses: tauri-apps/tauri-action@1deb371b0cd8bd54025b384f1cd735e725c4060f # action-v1.0.0
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        with:
+          projectPath: .
+          tauriScript: npm run tauri
+          args: --target x86_64-pc-windows-msvc --bundles nsis,msi
+          uploadWorkflowArtifacts: false
+          uploadUpdaterJson: false
+          retryAttempts: 1
+
+      - name: Verify installers and create checksums
+        run: |
+          $bundleRoot = "src-tauri/target/x86_64-pc-windows-msvc/release/bundle"
+          $nsis = @(Get-ChildItem "$bundleRoot/nsis/*.exe" -File -ErrorAction Stop)
+          $msi = @(Get-ChildItem "$bundleRoot/msi/*.msi" -File -ErrorAction Stop)
+          if ($nsis.Count -eq 0 -or $msi.Count -eq 0) {
+            throw "Expected both an NSIS installer and an MSI package."
+          }
+          $checksums = @($nsis + $msi) | ForEach-Object {
+            "$((Get-FileHash $_.FullName -Algorithm SHA256).Hash.ToLower())  $($_.Name)"
+          }
+          $checksums | Set-Content "$bundleRoot/SHA256SUMS.txt" -Encoding utf8
+          Get-Content "$bundleRoot/SHA256SUMS.txt"
+
+      - name: Upload Windows installers
+        if: success()
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: otf-dz-windows-x64-${{ github.sha }}
+          path: |
+            src-tauri/target/x86_64-pc-windows-msvc/release/bundle/nsis/*.exe
+            src-tauri/target/x86_64-pc-windows-msvc/release/bundle/msi/*.msi
+            src-tauri/target/x86_64-pc-windows-msvc/release/bundle/SHA256SUMS.txt
+          if-no-files-found: error
+          retention-days: 14
+          compression-level: 6
+
+  ui-screenshots:
+    name: Run cloud UI and capture screenshots
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - name: Check out source
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      - name: Set up Node.js
+        uses: actions/setup-node@949feb2413d6458794dcd2491c4babbbce0c15c1 # v7.1.0
+        with:
+          node-version: "24"
+          cache: npm
+          cache-dependency-path: package-lock.json
+
+      - name: Install locked frontend dependencies
+        run: npm ci
+
+      - name: Type-check and build the frontend
+        run: npm run build
+
+      - name: Install Playwright Chromium and system libraries
+        run: npx playwright install --with-deps chromium
+
+      - name: Run the built UI and capture desktop and mobile screenshots
+        run: npm run screenshots
+
+      - name: Upload UI screenshots and Playwright report
+        if: ${{ always() }}
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: otf-dz-ui-preview-${{ github.sha }}
+          path: |
+            artifacts/test-results/**/*.png
+            artifacts/playwright-report/
+          if-no-files-found: warn
+          retention-days: 14
+          compression-level: 6
+
+      - name: Add artifact download guidance
+        if: ${{ always() }}
+        shell: bash
+        run: |
+          {
+            echo "## Desktop and UI review"
+            echo ""
+            echo "Open this run's Artifacts section to download:"
+            echo ""
+            echo "- \`otf-dz-windows-x64-${GITHUB_SHA}\`: NSIS, MSI and SHA256 checksums (only after a successful Windows build)."
+            echo "- \`otf-dz-ui-preview-${GITHUB_SHA}\`: desktop/mobile PNG screenshots and the Playwright HTML report."
+            echo ""
+            echo "Extract the UI archive and open \`playwright-report/index.html\` for the review report."
+            echo "Browser screenshots do not validate the native Windows installer or WebView2 runtime."
+          } >> "$GITHUB_STEP_SUMMARY"
